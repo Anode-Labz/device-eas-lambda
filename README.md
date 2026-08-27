@@ -22,16 +22,27 @@ Fork this repository to quickstart lambda function development with Typescript. 
 - `npm run build` create ./dist/lambda.js bundle
 - `npm run zip` create the ./dist/lambda.zip from ./dist/lambda.js and ./dist/lambda.js.map
 - `npm run dist` run all of the above steps
-- `npm run stack` create or update the CloudFormation stack
-- `npm run deploy` used to deploy ./dist/lambda.zip to the created lambda function
+- `npm run stack` creates or updates the CloudFormation stack using the required environment variables below.
+- `npm run deploy` deploys `./dist/lambda.zip` to the configured Lambda function.
+
 - `npm start` will start the lambda function locally
 
-Hint: Currently the region is hardcoded to eu-west-1. TODO: AWS environment parameter should work.
-Example
+The deployment scripts require explicit configuration and do not provide placeholder credentials. Set `AWS_REGION`, `AWS_PROFILE`, `LAMBDA_STACK_NAME`, `LAMBDA_FUNCTION_NAME`, `SOME_PARAMETER`, `TEXTURE_API_KEY`, `ETHEREUM_PROVIDER`, `DAYLIGHT_SIGNING_KEY`, and `DAYLIGHT_DEVICE_CONTRACT_ADDRESS` before running the stack command. The Lambda Function URL uses AWS IAM authentication, so callers must sign requests with an authorized AWS identity.
+
+Example:
 
 ```
-AWS_REGION=eu-central-1 AWS_PROFILE=atombrenner npm run stack
+AWS_REGION=eu-central-1 AWS_PROFILE=atombrenner \
+LAMBDA_STACK_NAME=typescript-lambda LAMBDA_FUNCTION_NAME=typescript-lambda \
+SOME_PARAMETER="example parameter" TEXTURE_API_KEY="..." \
+ETHEREUM_PROVIDER="mainnet" DAYLIGHT_SIGNING_KEY="..." \
+DAYLIGHT_DEVICE_CONTRACT_ADDRESS="0x0000000000000000000000000000000000000000" \
+npm run stack
 ```
+
+### Device mint request
+
+The Lambda accepts a JSON body containing `deviceId`, `userAddress`, and `signature`. The signature must be an EIP-191 personal signature of `Dawn of Daylight device mint\nDevice ID: <deviceId>` created by `userAddress`. The request must be sent to the IAM-authenticated Function URL.
 
 ## Tools
 
