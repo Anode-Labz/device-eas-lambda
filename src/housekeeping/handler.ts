@@ -2,15 +2,26 @@ import { S3Client } from '@aws-sdk/client-s3'
 import { ScheduledEvent } from 'aws-lambda'
 import { housekeeping } from './housekeeping'
 
-const bucket = process.env['BUCKET'] || 'please-name-your-bucket'
+function requiredEnvironment(name: string): string {
+  const value = process.env[name]
 
-const s3 = new S3Client({
-  region: process.env['REGION'] || 'eu-central-1',
-})
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`)
+  }
 
-export async function handler(event: ScheduledEvent) {
-  console.log(JSON.stringify(event, null, 2))
-  console.log('Housekeeping started for Bucket ' + bucket)
+  return value
+}
+
+const bucket = requiredEnvironment('BUCKET')
+const s3 = new S3Client({ region: requiredEnvironment('AWS_REGION') })
+
+export async function handler(event: ScheduledEvent): Promise<void> {
+  console.log('Housekeeping started', {
+    eventId: event.id,
+    source: event.source,
+    time: event.time,
+    bucket,
+  })
   await housekeeping(s3, bucket)
-  console.log('Housekeeping finished')
+  console.log('Housekeeping finished', { bucket })
 }

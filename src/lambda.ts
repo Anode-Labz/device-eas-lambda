@@ -1,118 +1,239 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2, Context } from 'aws-lambda'
-// import { EAS, SchemaEncoder } from '@ethereum-attestation-service/eas-sdk'
 import { ethers } from 'ethers'
 
-// AWS Lambda Function Urls are reusing types from APIGateway
-// but many fields are not used or filled with default values
-// see: https://docs.aws.amazon.com/lambda/latest/dg/urls-invocation.html
-// It would be nice to have types with only the used fields and add them to:
-// https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/aws-lambda
 type LambdaFunctionUrlEvent = APIGatewayProxyEventV2
 type LambdaFunctionUrlResult = APIGatewayProxyResultV2
 
-// Note: think of enhancing logging with structure (JSON) and metrics
-// - @atombrenner/log-json: https://github.com/atombrenner/npm-log-json
-// - pino: https://github.com/pinojs/pino
-// - https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format.html
-// - @aws-lambda-powertools/metrics: https://docs.powertools.aws.dev/lambda/typescript/latest/core/metrics/#getting-started
+export type DeviceMintRequest = {
+  deviceId: string
+  userAddress: string
+  signature: string
+}
 
-// TODO: ENV VARIABLES
-const TEXTURE_API_KEY = process.env.TEXTURE_API_KEY || '<your-api-key-goes-here>'
-const ETHEREUM_PROVIDER = process.env.ETHEREUM_PROVIDER || 'url'
-const DAYLIGHT_SIGNING_KEY = process.env.DAYLIGHT_SIGNING_KEY || 'key'
+export type TextureDevice = {
+  manufacturerDeviceId: string
+  deviceType: string
+  manufacturer: string
+}
+
+const textureApiUrl = 'https://api.texturehq.com/v1/devices'
+const daylightDeviceContractAbi = ['function mintDevice(bytes data) public returns (uint256)']
+
+class InvalidRequestError extends Error {}
+
+class UpstreamServiceError extends Error {}
+
+class ConfigurationError extends Error {}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+export function deviceMintMessage(deviceId: string): string {
+  return `Dawn of Daylight device mint\nDevice ID: ${deviceId}`
+}
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name]
+
+  if (!value) {
+    throw new ConfigurationError(`Missing required environment variable: ${name}`)
+  }
+
+  return value
+}
+
+function jsonResponse(statusCode: number, body: Record<string, unknown>): LambdaFunctionUrlResult {
+  return {
+    statusCode,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }
+}
+
+export function parseDeviceRequest(
+  body: string | undefined,
+  isBase64Encoded = false
+): DeviceMintRequest {
+  if (!body) {
+    throw new InvalidRequestError('The request body is required')
+  }
+
+  const decodedBody = isBase64Encoded ? Buffer.from(body, 'base64').toString('utf8') : body
+  let parsedBody: unknown
+
+  try {
+    parsedBody = JSON.parse(decodedBody)
+  } catch {
+    throw new InvalidRequestError('The request body must be valid JSON')
+  }
+
+  if (!isRecord(parsedBody)) {
+    throw new InvalidRequestError('The request body must be a JSON object')
+  }
+
+  const { deviceId, userAddress, signature } = parsedBody
+
+  if (
+    typeof deviceId !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,128}$/.test(deviceId) ||
+    typeof userAddress !== 'string' ||
+    !ethers.isAddress(userAddress) ||
+    typeof signature !== 'string' ||
+    !ethers.isHexString(signature, 65)
+  ) {
+    throw new InvalidRequestError('The request contains an invalid device ID, user address, or signature')
+  }
+
+  const normalizedUserAddress = ethers.getAddress(userAddress)
+
+  try {
+    if (ethers.getAddress(ethers.verifyMessage(deviceMintMessage(deviceId), signature)) !== normalizedUserAddress) {
+      throw new InvalidRequestError('The signature does not match the requested user address')
+    }
+  } catch (error) {
+    if (error instanceof InvalidRequestError) {
+      throw error
+    }
+
+    throw new InvalidRequestError('The signature is invalid')
+  }
+
+  return {
+    deviceId,
+    userAddress: normalizedUserAddress,
+    signature,
+  }
+}
+
+export function parseTextureDevice(payload: unknown): TextureDevice {
+  if (!isRecord(payload)) {
+    throw new UpstreamServiceError('Texture returned an invalid device payload')
+  }
+
+  const { manufacturerDeviceId, deviceType, manufacturer } = payload
+
+  if (
+    typeof manufacturerDeviceId !== 'string' ||
+    manufacturerDeviceId.length === 0 ||
+    typeof deviceType !== 'string' ||
+    deviceType.length === 0 ||
+    typeof manufacturer !== 'string' ||
+    manufacturer.length === 0
+  ) {
+    throw new UpstreamServiceError('Texture returned incomplete device data')
+  }
+
+  return { manufacturerDeviceId, deviceType, manufacturer }
+}
+
+export function encodeMintData(request: DeviceMintRequest, device: TextureDevice): string {
+  return ethers.AbiCoder.defaultAbiCoder().encode(
+    ['address', 'bytes32', 'bytes32', 'bytes32'],
+    [
+      request.userAddress,
+      ethers.id(device.manufacturerDeviceId),
+      ethers.id(device.deviceType),
+      ethers.id(device.manufacturer),
+    ]
+  )
+}
 
 export async function handler(
   event: LambdaFunctionUrlEvent,
   context: Context
 ): Promise<LambdaFunctionUrlResult> {
-  console.log(context.functionName)
-  console.log(`${event.requestContext.http.method} ${event.rawPath}`)
+  if (event.requestContext.http.method !== 'POST') {
+    return jsonResponse(405, { error: 'Method not allowed' })
+  }
 
-  // inputs: accountAddress, deviceId
-
-  let body = JSON.parse(event.body!)
-
-  // texture GET device by device_id
-  const deviceId = body.deviceId
-  const textureApiUrl = `https://api.texturehq.com/v1/devices`
-
-  // Node v18 has fetch built in
-  let response = await fetch(`${textureApiUrl}/${deviceId}`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      'Texture-Api-Key': TEXTURE_API_KEY,
-    },
+  console.log('Processing device mint request', {
+    functionName: context.functionName,
+    requestId: context.awsRequestId,
+    method: event.requestContext.http.method,
+    path: event.rawPath,
   })
 
-  let deviceJson: any = await response.json()
+  let request: DeviceMintRequest
 
-  // check if device and account pair is valid (same location as other devices, etc...)
+  try {
+    request = parseDeviceRequest(event.body, event.isBase64Encoded)
+  } catch (error) {
+    console.warn('Rejected invalid device mint request', {
+      requestId: context.awsRequestId,
+      errorType: error instanceof Error ? error.name : 'UnknownError',
+    })
+    return jsonResponse(400, { error: 'Invalid request' })
+  }
 
-  // load ethereum signer and provider
-  // Second parameter is chainId, 1 for Ethereum mainnet
-  const provider = new ethers.InfuraProvider(ETHEREUM_PROVIDER)
-  const signer = new ethers.Wallet(DAYLIGHT_SIGNING_KEY, provider)
+  try {
+    const textureApiKey = requiredEnvironment('TEXTURE_API_KEY')
+    const ethereumProvider = requiredEnvironment('ETHEREUM_PROVIDER')
+    const daylightSigningKey = requiredEnvironment('DAYLIGHT_SIGNING_KEY')
+    const contractAddress = requiredEnvironment('DAYLIGHT_DEVICE_CONTRACT_ADDRESS')
 
-  const daylightDeviceContractAddress = ''
-  const daylightDeviceContractAbi = ['function mintDevice(bytes data) public returns (uint256)']
+    if (!ethers.isAddress(contractAddress)) {
+      throw new ConfigurationError('DAYLIGHT_DEVICE_CONTRACT_ADDRESS must be a valid address')
+    }
 
-  const daylightDeviceContract: any = new ethers.Contract(
-    daylightDeviceContractAddress,
-    daylightDeviceContractAbi,
-    signer
-  )
+    let textureResponse: Response
 
-  let mintData = ethers.AbiCoder.defaultAbiCoder().encode(
-    ['address', 'bytes32', 'bytes32', 'bytes32'],
-    [
-      body.userAddress,
-      ethers.hashMessage(deviceJson.manufacturerDeviceId),
-      deviceJson.deviceType,
-      deviceJson.manufacturer,
-    ]
-  )
-  let tx = await daylightDeviceContract.mintDevice(mintData)
-  let submittedTx = await tx.wait()
+    try {
+      textureResponse = await fetch(`${textureApiUrl}/${encodeURIComponent(request.deviceId)}`, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          'Texture-Api-Key': textureApiKey,
+        },
+        signal: AbortSignal.timeout(5000),
+      })
+    } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+        throw new UpstreamServiceError('Texture request timed out')
+      }
 
-  // make EAS attestation of device ownership
-  // const EASContractAddress = '0xC2679fBD37d54388Ce493F1DB75320D236e1815e' // sepolia v0
-  // const eas = new EAS(EASContractAddress)
-  // eas.connect(signer)
+      throw error
+    }
 
-  // // TODO: write schema
-  // const schemaEncoder = new SchemaEncoder('uint256 eventId, uint8 voteIndex')
-  // const encodedData = schemaEncoder.encodeData([
-  //   { name: 'eventId', value: 1, type: 'uint256' },
-  //   { name: 'voteIndex', value: 1, type: 'uint8' },
-  // ])
+    if (!textureResponse.ok) {
+      throw new UpstreamServiceError(`Texture returned HTTP ${textureResponse.status}`)
+    }
 
-  // const schemaUID = '0xb16fa048b0d597f5a821747eba64efa4762ee5143e9a80600d0005386edfc995'
+    let texturePayload: unknown
 
-  // const transaction = await eas.attest({
-  //   schema: schemaUID,
-  //   data: {
-  //     recipient: '0xFD50b031E778fAb33DfD2Fc3Ca66a1EeF0652165',
-  //     expirationTime: 0,
-  //     revocable: false, // Be aware that if your schema is not revocable, this MUST be false
-  //     data: encodedData,
-  //   },
-  // })
+    try {
+      texturePayload = await textureResponse.json()
+    } catch {
+      throw new UpstreamServiceError('Texture returned invalid JSON')
+    }
 
-  // const newAttestationUID = await transaction.wait()
+    const device = parseTextureDevice(texturePayload)
+    const provider = new ethers.InfuraProvider(ethereumProvider)
+    const signer = new ethers.Wallet(daylightSigningKey, provider)
+    const contract = new ethers.Contract(contractAddress, daylightDeviceContractAbi, signer)
+    const transaction = await contract.mintDevice(encodeMintData(request, device))
+    const receipt = await transaction.wait()
 
-  // load ethereum provider and signer
+    if (!receipt) {
+      throw new Error('The device mint transaction did not produce a receipt')
+    }
 
-  return {
-    statusCode: 200,
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(
-      {
-        // attestationUid: newAttestationUID,
-        transaction: submittedTx.toJSON(),
-      },
-      null,
-      2
-    ),
+    return jsonResponse(200, { transactionHash: receipt.hash })
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : 'UnknownError'
+    console.error('Device mint request failed', {
+      requestId: context.awsRequestId,
+      errorType,
+    })
+
+    if (error instanceof ConfigurationError) {
+      return jsonResponse(500, { error: 'The service is not configured correctly' })
+    }
+
+    if (error instanceof UpstreamServiceError) {
+      return jsonResponse(502, { error: 'The device service is unavailable' })
+    }
+
+    return jsonResponse(500, { error: 'The device mint could not be completed' })
   }
 }
